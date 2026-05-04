@@ -7,6 +7,10 @@ on:
         description: '🎬 YouTube Video URL'
         required: true
         type: string
+      session_id:
+        description: '🔑 Unique session ID (user_timestamp)'
+        required: true
+        type: string
       type:
         description: '📦 Output Type'
         required: true
@@ -278,15 +282,16 @@ jobs:
           YT_URL: ${{ github.event.inputs.url }}
           OUTPUT_TYPE: ${{ github.event.inputs.type }}
           QUALITY: ${{ github.event.inputs.quality }}
-
+          
       - name: ⬇️ Download Converted File
         run: |
+          SESSION_ID="${{ github.event.inputs.session_id }}"
           DOWNLOAD_URL=$(sed -n '1p' /tmp/metadata.txt)
           FILENAME=$(sed -n '2p' /tmp/metadata.txt)
           OUTPUT_TYPE=$(sed -n '4p' /tmp/metadata.txt)
           QUALITY=$(sed -n '5p' /tmp/metadata.txt)
           
-          mkdir -p ./downloads/temp
+          mkdir -p "./downloads/$SESSION_ID"
           
           echo "⬇️ Downloading $OUTPUT_TYPE @ $QUALITY..."
           echo "📄 File: $FILENAME"
@@ -295,18 +300,18 @@ jobs:
             -L \
             -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0" \
             -H "Referer: https://media.ytmp3.gg/" \
-            -o "./downloads/temp/$FILENAME" \
+            -o "./downloads/$SESSION_ID/$FILENAME" \
             --max-time 300 \
             --retry 3 \
             --retry-delay 5 \
             "$DOWNLOAD_URL"
           
-          if [ ! -f "./downloads/temp/$FILENAME" ]; then
+          if [ ! -f "./downloads/$SESSION_ID/$FILENAME" ]; then
             echo "❌ Download failed!"
             exit 1
           fi
           
-          FILE_SIZE=$(stat -c%s "./downloads/temp/$FILENAME")
+          FILE_SIZE=$(stat -c%s "./downloads/$SESSION_ID/$FILENAME")
           FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
           
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
