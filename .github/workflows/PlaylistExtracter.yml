@@ -1,0 +1,63 @@
+name: 🧩Extract-YouTube-Playlist
+
+on:
+  workflow_dispatch:
+    inputs:
+      playlist_url:
+        description: "YouTube Playlist URL"
+        required: true
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup yt-dlp
+        uses: AnimMouse/setup-yt-dlp@v3   # cleaner than pip install :contentReference[oaicite:1]{index=1}
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Extract playlist JSON
+        run: |
+          yt-dlp \
+            --flat-playlist \
+            --dump-single-json \
+            "${{ github.event.inputs.playlist_url }}" \
+            > playlist.json
+
+      - name: Generate Markdown with playlist name
+        run: |
+          # extract playlist title safely
+          PLAYLIST_NAME=$(jq -r '.title' playlist.json | sed 's#[^a-zA-Z0-9 _-]##g')
+
+          # fallback if empty
+          if [ -z "$PLAYLIST_NAME" ] || [ "$PLAYLIST_NAME" = "null" ]; then
+            PLAYLIST_NAME="unknown-playlist"
+          fi
+
+          FOLDER="playlists"
+          mkdir -p "$FOLDER"
+
+          FILE="$FOLDER/playlist-${PLAYLIST_NAME}.md"
+
+          echo "| # | Title | Link |" > "$FILE"
+          echo "|---|---|---|" >> "$FILE"
+
+          jq -r '.entries[] | [.playlist_index, .title, "https://youtube.com/watch?v=" + .id] | @tsv' playlist.json \
+          | while IFS=$'\t' read -r idx title link; do
+              echo "| $idx | $title | $link |" >> "$FILE"
+            done
+
+          echo "Generated: $FILE"
+
+      - name: Commit result (optional)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          git add playlists/
+          git commit -m "Add playlist markdown"
+          git push
