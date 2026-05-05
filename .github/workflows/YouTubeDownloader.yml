@@ -332,7 +332,9 @@ jobs:
               echo "   Parts size: ${THRESHOLD_MB}MB each"
               
               cd ./downloads
-              zip -r -s "${THRESHOLD_MB}m" "${basename}.zip" "temp/${basename}"
+              # Clean filename: remove leading dashes/underscores and replace problematic chars
+              safe_name=$(echo "${basename}" | sed 's/^[-_]*//' | sed 's/[][(){}<>|;:&$!*?\\\/'"'"']/_/g')
+              zip -r -s "${THRESHOLD_MB}m" "${safe_name}.zip" "temp/${basename}"
               cd ..
               
               PARTS_COUNT=$(ls ./downloads/${basename}.z* 2>/dev/null | wc -l)
