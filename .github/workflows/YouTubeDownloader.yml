@@ -7,6 +7,10 @@ on:
         description: '🎬 YouTube Video URL'
         required: true
         type: string
+      session_id:
+        description: '🔑 Unique session ID (user_timestamp)'
+        required: true
+        type: string
       type:
         description: '📦 Output Type'
         required: true
@@ -278,15 +282,16 @@ jobs:
           YT_URL: ${{ github.event.inputs.url }}
           OUTPUT_TYPE: ${{ github.event.inputs.type }}
           QUALITY: ${{ github.event.inputs.quality }}
-
+          
       - name: ⬇️ Download Converted File
         run: |
+          SESSION_ID="${{ github.event.inputs.session_id }}"
           DOWNLOAD_URL=$(sed -n '1p' /tmp/metadata.txt)
           FILENAME=$(sed -n '2p' /tmp/metadata.txt)
           OUTPUT_TYPE=$(sed -n '4p' /tmp/metadata.txt)
           QUALITY=$(sed -n '5p' /tmp/metadata.txt)
           
-          mkdir -p ./downloads/temp
+          mkdir -p "./downloads/$SESSION_ID"
           
           echo "⬇️ Downloading $OUTPUT_TYPE @ $QUALITY..."
           echo "📄 File: $FILENAME"
@@ -295,18 +300,18 @@ jobs:
             -L \
             -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0" \
             -H "Referer: https://media.ytmp3.gg/" \
-            -o "./downloads/temp/$FILENAME" \
+            -o "./downloads/$SESSION_ID/$FILENAME" \
             --max-time 300 \
             --retry 3 \
             --retry-delay 5 \
             "$DOWNLOAD_URL"
           
-          if [ ! -f "./downloads/temp/$FILENAME" ]; then
+          if [ ! -f "./downloads/$SESSION_ID/$FILENAME" ]; then
             echo "❌ Download failed!"
             exit 1
           fi
           
-          FILE_SIZE=$(stat -c%s "./downloads/temp/$FILENAME")
+          FILE_SIZE=$(stat -c%s "./downloads/$SESSION_ID/$FILENAME")
           FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
           
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -317,11 +322,12 @@ jobs:
 
       - name: ✂️ Smart Split Large Files
         run: |
+          SESSION_ID="${{ github.event.inputs.session_id }}"
           THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
           THRESHOLD_BYTES=$((THRESHOLD_MB * 1024 * 1024))
           
           process_file() {
-            local file="$1"
+            local file="./downloads/$SESSION_ID/$1"
             local size=$(stat -c%s "$file")
             local basename=$(basename "$file")
             local size_mb=$((size / 1024 / 1024))
@@ -332,13 +338,13 @@ jobs:
               echo "   Parts size: ${THRESHOLD_MB}MB each"
               
               cd ./downloads
-              zip -r -s "${THRESHOLD_MB}m" "${basename}.zip" "temp/${basename}"
+              zip -r -s "${THRESHOLD_MB}m" "${basename}.zip" "$SESSION_ID/${basename}"
               cd ..
               
               PARTS_COUNT=$(ls ./downloads/${basename}.z* 2>/dev/null | wc -l)
               echo "✅ Created $PARTS_COUNT parts"
               
-              # Remove original file from temp
+              # Remove original file
               rm "$file"
             else
               if [[ $THRESHOLD_BYTES -eq 0 ]]; then
@@ -346,20 +352,17 @@ jobs:
               else
                 echo "📁 $basename (${size_mb}MB) — under threshold"
               fi
-              mv "$file" "./downloads/"
             fi
           }
           
-          export -f process_file
-          export THRESHOLD_BYTES THRESHOLD_MB
-          
-          find ./downloads/temp -type f -exec bash -c 'process_file "$0"' {} \;
-          rm -rf ./downloads/temp
-          
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📂 Final files in ./downloads/:"
-          ls -lh ./downloads/ 2>/dev/null | tail -n +2 | awk '{print "  • " $NF " (" $5 ")"}'
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          # Find the file in the session folder
+          filename=$(ls "./downloads/$SESSION_ID/" 2>/dev/null | head -1)
+          if [ -n "$filename" ]; then
+            process_file "$filename"
+          else
+            echo "❌ No file found in ./downloads/$SESSION_ID/"
+            exit 1
+          fi
 
       - name: 📤 Commit and Push to Repository
         run: |

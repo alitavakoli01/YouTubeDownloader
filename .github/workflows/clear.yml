@@ -1,39 +1,32 @@
-name: Clean downloads folder
+name: Clean old downloads
 
 on:
-  workflow_dispatch:
-    inputs:
-      warning:
-        description: '⚠️ WARNING: This will DELETE ALL files inside downloads/ folder. Click "Run workflow" only if you are sure.'
-        required: false
-        default: 'Read this warning before proceeding'
+  schedule:
+    - cron: '0 */3 * * *'   # هر 3 ساعت یکبار اجرا شود (می‌توانید به روزانه تغییر دهید)
+  workflow_dispatch:        # امکان اجرای دستی
 
 jobs:
-  delete:
+  cleanup:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Remove downloads folder and recreate it
+      - name: Delete files older than 24 hours
         run: |
-          rm -rf downloads
-          mkdir downloads
+          find ./downloads -type f -mmin +1440 -delete
+          find ./downloads -type d -empty -delete
 
-      - name: Commit and push empty folder
+      - name: Commit and push changes
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-
-          git add downloads
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add -A
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "[AVASAM] Empty downloads folder [skip ci]"
-            git pull --rebase origin "${{ github.ref_name }}"
-            git push origin HEAD:"${{ github.ref_name }}"
-            echo "✅ downloads folder cleared"
+            git commit -m "cleanup: remove old downloads (older than 24h)"
+            git push
           fi
