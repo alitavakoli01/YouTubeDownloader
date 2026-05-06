@@ -45,6 +45,9 @@ env:
   PYTHONUNBUFFERED: '1'
   DEBIAN_FRONTEND: 'noninteractive'
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   download-and-process:
     name: 🚀 YouTube Downloader
