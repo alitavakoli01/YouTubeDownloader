@@ -446,6 +446,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "bot@github.com"
           
+          # Create a unique branch name (no protected branch issues)
+          BRANCH="downloaded-$(date +%Y%m%d-%H%M%S)"
+          echo "🔄 Creating branch: $BRANCH"
+          git checkout -b "$BRANCH"
+          
           echo ""
           echo "📋 Adding all files..."
           git add -A
@@ -454,29 +459,24 @@ jobs:
           echo "   Found $TOTAL files"
           
           if [ "$TOTAL" -eq 0 ]; then
-            echo "❌ Nothing to push"
+            echo "⚠️ Nothing to push – no changes detected"
             exit 0
           fi
           
+          echo "   Files added:"
           git diff --cached --name-only | while read f; do
             echo "   📎 $f"
           done
           
           echo ""
-          echo "📤 Pushing..."
+          echo "📝 Committing..."
+          git commit -m "📦 YouTube download $(date +%Y%m%d-%H%M%S) [skip ci]" --quiet
           
-          git commit -m "📦 $(date +%m%d-%H%M) [skip ci]" --quiet
-          
-          for i in 1 2 3 4 5; do
-            echo -n "   🚀 Attempt $i/5..."
-            if git pull --rebase --quiet 2>/dev/null && git push --quiet 2>/dev/null; then
-              echo " ✅ DONE!"
-              exit 0
-            fi
-            echo " ❌"
-            git rebase --abort 2>/dev/null
-            [ $i -lt 5 ] && sleep $((i*5))
-          done
-          
-          echo "   ❌ Push failed"
-          exit 1
+          echo "📤 Pushing branch $BRANCH to origin..."
+          if git push origin "$BRANCH" --quiet; then
+            echo "✅ Successfully pushed to branch: $BRANCH"
+            echo "🔗 You can view it at: https://github.com/${{ github.repository }}/tree/$BRANCH"
+          else
+            echo "❌ Git push failed (exit code $?)"
+            exit 1
+          fi
