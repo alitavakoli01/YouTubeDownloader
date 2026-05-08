@@ -1,0 +1,467 @@
+name: 🎯 YouTube Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '🔄 Download Mode (for YouTube only)'
+        required: true
+        type: choice
+        options:
+          - single
+          - playlist
+          - channel
+          - search
+        default: 'single'
+      url:
+        description: '🎬 URL (YouTube or any direct file URL)'
+        required: true
+        type: string
+      type:
+        description: '📦 Output Type (for YouTube only)'
+        required: true
+        type: choice
+        options:
+          - video
+          - audio
+        default: 'video'
+      quality:
+        description: 'Quality (video: 144/360/480/720/1080 | audio: 128/192/320)'
+        required: false
+        type: string
+        default: '720'
+      max_videos:
+        description: '🔢 Max results (for YouTube playlist/channel)'
+        required: false
+        type: number
+        default: 10
+      split_threshold_mb:
+        description: '📦 Split > MB (0=no)'
+        required: false
+        type: number
+        default: 50
+
+env:
+  PYTHONUNBUFFERED: '1'
+  DEBIAN_FRONTEND: 'noninteractive'
+
+jobs:
+  download-and-process:
+    name: 🚀 Universal Downloader
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}
+
+      - name: ⚡ Setup
+        run: |
+          python3 -c "import requests" 2>/dev/null || pip3 install -q requests
+          command -v yt-dlp &>/dev/null || pip3 install -q yt-dlp
+          command -v zip &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq zip)
+
+      - name: 🔗 Prepare
+        id: prep
+        run: |
+          M="${{ github.event.inputs.mode }}"
+          U="${{ github.event.inputs.url }}"
+          # Only fix channel URLs if it's a YouTube channel without http
+          if [[ "$M" == "channel" && "$U" != http* ]]; then
+            U="https://www.youtube.com/$([[ "$U" == @* ]] && echo "$U" || echo "@$U")"
+          fi
+          echo "URL=$U" >> $GITHUB_OUTPUT
+          echo "MODE=$M" >> $GITHUB_OUTPUT
+
+      - name: 🎯 Download & Process
+        id: main
+        env:
+          MODE: ${{ steps.prep.outputs.MODE }}
+          URL: ${{ steps.prep.outputs.URL }}
+          TYPE: ${{ github.event.inputs.type }}
+          QUALITY: ${{ github.event.inputs.quality }}
+          MAX: ${{ github.event.inputs.max_videos }}
+          SPLIT: ${{ github.event.inputs.split_threshold_mb }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, time, re, subprocess, sys, hashlib
+          import requests as rq
+          from pathlib import Path
+          from datetime import datetime
+          from urllib.parse import urlparse, unquote
+          import mimetypes
+
+          M = os.environ['MODE']
+          U = os.environ['URL']
+          T = os.environ['TYPE']
+          Q = os.environ.get('QUALITY', '720')
+          MX = int(os.environ.get('MAX', '10'))
+          SP = int(os.environ.get('SPLIT', '50'))
+
+          # ========== Helper functions ==========
+          def is_youtube_url(url):
+              patterns = [r'youtube\.com', r'youtu\.be', r'youtube']
+              return any(re.search(p, url, re.I) for p in patterns)
+
+          def safe_name(text, maxlen=40):
+              safe = re.sub(r'[^\w]', '_', text)[:maxlen]
+              safe = re.sub(r'_+', '_', safe).strip('_')
+              if not safe:
+                  safe = hashlib.md5(text.encode()).hexdigest()[:8]
+              return safe
+
+          def split_file(filepath, threshold_mb):
+              size_mb = filepath.stat().st_size / 1e6
+              if threshold_mb > 0 and size_mb > threshold_mb:
+                  print(f'   ✂️ Splitting ({size_mb:.0f}MB) into {threshold_mb}MB parts...')
+                  parent = filepath.parent
+                  name = filepath.name
+                  subprocess.run(['zip', '-r', '-q', '-s', f'{threshold_mb}m', f'{name}.zip', name], cwd=parent, check=True)
+                  filepath.unlink()
+                  parts = sorted(parent.glob(f'{name}.z*'))
+                  print(f'   ✅ Split into {len(parts)} parts')
+                  return True
+              return False
+
+          def download_direct_file(url, output_path):
+              """Generic direct download using requests"""
+              try:
+                  print(f'   ⬇️ Downloading from URL...')
+                  headers = {'User-Agent': 'Mozilla/5.0'}
+                  resp = rq.get(url, headers=headers, stream=True, timeout=120)
+                  if resp.status_code != 200:
+                      print(f'   ❌ HTTP {resp.status_code}')
+                      return False, 0
+                  
+                  # Get filename from URL or Content-Disposition
+                  content_disp = resp.headers.get('Content-Disposition', '')
+                  if 'filename=' in content_disp:
+                      fname = re.findall(r'filename[^;=\n]*=(([\'"]).*?\2|[^;\n]*)', content_disp)
+                      if fname:
+                          fname = fname[0][0].strip('\'"')
+                          fname = unquote(fname)
+                  else:
+                      fname = os.path.basename(urlparse(url).path)
+                      if not fname or '.' not in fname:
+                          content_type = resp.headers.get('Content-Type', '')
+                          ext = mimetypes.guess_extension(content_type) or '.bin'
+                          fname = f'download{ext}'
+                  
+                  total = int(resp.headers.get('content-length', 0))
+                  with open(output_path, 'wb') as f:
+                      downloaded = 0
+                      for chunk in resp.iter_content(65536):
+                          f.write(chunk)
+                          downloaded += len(chunk)
+                          if total > 0:
+                              percent = downloaded * 100 / total
+                              print(f'\r   ⬇️ {percent:.1f}%', end='')
+                  print(f'\r   ⬇️ 100.0%')
+                  return True, downloaded
+              except Exception as e:
+                  print(f'   ❌ Error: {e}')
+                  return False, 0
+
+          # ========== YouTube specific functions (original) ==========
+          API = 'https://hub.ytconvert.org/api/download'
+          H = {
+              'User-Agent': 'Mozilla/5.0',
+              'Accept': 'application/json',
+              'Referer': 'https://media.ytmp3.gg/',
+              'Content-Type': 'application/json',
+              'Origin': 'https://media.ytmp3.gg'
+          }
+
+          def gv(vid):  # get video info (same as original)
+              try:
+                  r = subprocess.run(
+                      ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate',
+                       f'https://youtube.com/watch?v={vid}'],
+                      capture_output=True, text=True, timeout=15
+                  )
+                  if r.returncode == 0 and r.stdout.strip():
+                      d = json.loads(r.stdout)
+                      channel = (d.get('channel') or d.get('uploader') or 
+                                d.get('uploader_id') or d.get('creator') or 'Unknown')
+                      views = d.get('view_count')
+                      duration = d.get('duration', 0)
+                      channel_url = d.get('channel_url', '') or d.get('uploader_url', '')
+                      handle = None
+                      if channel_url:
+                          m = re.search(r'@([\w-]+)', channel_url)
+                          if m: handle = m.group(1)
+                      if not handle:
+                          handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
+                      return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
+              except: pass
+              return ('Unknown', None, 0, None)
+
+          def get_channel_from_url(url):
+              m = re.search(r'@([\w-]+)', url)
+              if m: return m.group(1)
+              m = re.search(r'channel/([\w-]+)', url)
+              if m: return m.group(1)
+              m = re.search(r'c/([\w-]+)', url)
+              if m: return m.group(1)
+              m = re.search(r'user/([\w-]+)', url)
+              if m: return m.group(1)
+              return None
+
+          def get_channel_from_playlist(playlist_url):
+              try:
+                  cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--playlist-end', '1',
+                         '--no-warnings', '--no-check-certificate', playlist_url]
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                  if r.returncode == 0 and r.stdout.strip():
+                      d = json.loads(r.stdout.strip().split('\n')[0])
+                      vid = d.get('id', '')
+                      if vid:
+                          _, _, _, handle = gv(vid)
+                          if handle: return handle
+                      ch = d.get('channel') or d.get('uploader') or d.get('uploader_id')
+                      if ch: return safe_name(ch, 30)
+              except: pass
+              return None
+
+          def gvl(u, n):
+              v = []
+              channel_folder = get_channel_from_url(u)
+              if not channel_folder and 'playlist' in u:
+                  print(f'   🔍 Detecting channel from playlist...')
+                  channel_folder = get_channel_from_playlist(u)
+              if not channel_folder:
+                  channel_folder = 'playlist_videos'
+              print(f'   📁 Folder: {channel_folder}_videos')
+              c = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate']
+              if n > 0: c.extend(['--playlist-end', str(n)])
+              c.append(u)
+              r = subprocess.run(c, capture_output=True, text=True, timeout=30)
+              for line in r.stdout.strip().split('\n'):
+                  if line and len(v) < n:
+                      try:
+                          d = json.loads(line)
+                          vid = d.get('id', '')
+                          if not vid: continue
+                          title = d.get('title', 'Untitled')[:60]
+                          ch, vw, dr, _ = gv(vid)
+                          if not ch or ch == 'Unknown':
+                              ch = (d.get('channel') or d.get('uploader') or 
+                                    d.get('uploader_id') or d.get('creator') or 'Unknown')
+                          if not vw: vw = d.get('view_count')
+                          if not dr: dr = d.get('duration', 0)
+                          v.append({
+                              'id': vid, 't': title, 'u': f'https://youtube.com/watch?v={vid}',
+                              'dr': int(dr) if dr else 0,
+                              'th': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg',
+                              'c': str(ch).strip() if ch else 'Unknown',
+                              'v': f'{int(vw)/1e6:.1f}M' if vw and int(vw) >= 1e6 else str(vw) if vw else 'N/A'
+                          })
+                      except: continue
+              return v, channel_folder
+
+          def dl_video(u):
+              e = 'mp3' if T == 'audio' else 'mp4'
+              p = {'url': u, 'os': 'linux', 'output': {'type': 'audio' if T == 'audio' else 'video', 'format': e}}
+              if T == 'audio': p['audio'] = {'bitrate': f'{Q}k'}
+              else: p['output']['quality'] = f'{Q}p'
+              for retry in range(3):
+                  if retry > 0:
+                      print(f'   🔄 Retry {retry}/3...')
+                      time.sleep(5)
+                  try:
+                      rr = rq.post(API, json=p, headers=H, timeout=15)
+                      if rr.status_code != 200: continue
+                      d = rr.json()
+                      su = d.get('statusUrl')
+                      if not su: continue
+                      print(f'   ⏳ Converting...')
+                      for _ in range(60):
+                          time.sleep(2)
+                          try:
+                              sr = rq.get(su, headers=H, timeout=10)
+                              if sr.status_code == 200:
+                                  sd = sr.json()
+                                  st = sd.get('status', '')
+                                  if st == 'completed':
+                                      du = sd.get('downloadUrl')
+                                      if du: return {'u': du, 'e': e}
+                                  elif st in ('failed', 'error'): break
+                          except: continue
+                  except: pass
+              return None
+
+          def download_file(url, filepath):
+              try:
+                  dr = rq.get(url, headers=H, stream=True, timeout=600)
+                  if dr.status_code == 200:
+                      total = int(dr.headers.get('content-length', 0))
+                      done = 0
+                      with open(filepath, 'wb') as f:
+                          for chunk in dr.iter_content(65536):
+                              f.write(chunk)
+                              done += len(chunk)
+                              if total > 0 and done % (10*65536) == 0:
+                                  print(f'\r   ⬇️ {done*100/total:.1f}%', end='')
+                      print(f'\r   ⬇️ 100.0%')
+                      return filepath.stat().st_size
+              except Exception as e:
+                  print(f'   ❌ Download error: {e}')
+              return 0
+
+          def mkidx(v, cn, cd):
+              ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+              Path('./playlists').mkdir(exist_ok=True)
+              inf = cd / 'info'
+              inf.mkdir(parents=True, exist_ok=True)
+              idxf = f'playlists/{cn}_{ts}.md'
+              m = f'# 📺 {cn}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(v)} videos**\n\n| # | Thumbnail | Title | Duration | Views |\n|---|-----------|-------|----------|-------|\n'
+              for i, x in enumerate(v, 1):
+                  dur_str = f'{x["dr"]//60}:{x["dr"]%60:02d}' if x['dr'] else '?'
+                  m += f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) | [{x["t"]}]({x["u"]}) | {dur_str} | {x["v"]} |\n'
+              m += '\n---\n\n## 📝 Details\n\n'
+              for i, x in enumerate(v, 1):
+                  sn = f'v{i:03d}_{x["id"]}'
+                  dur_str = f'{x["dr"]//60} minutes' if x['dr'] else 'Unknown'
+                  info_md = (f'# 🎬 {x["t"]}\n\n![Thumbnail]({x["th"]})\n\n## Info\n\n| Property | Value |\n|----------|-------|\n| **Channel** | {x["c"]} |\n| **Duration** | {dur_str} |\n| **Views** | {x["v"]} |\n| **Video ID** | `{x["id"]}` |\n| **URL** | {x["u"]} |\n\n## Thumbnail\n\n<img src="{x["th"]}" width="640">\n\n---\n*Downloaded: {datetime.now():%Y-%m-%d %H:%M}*')
+                  (inf / f'{sn}.md').write_text(info_md)
+                  m += (f'### {i}. {x["t"]}\n\n![Thumbnail]({x["th"]})\n\n- **{dur_str}** | **{x["v"]}** views | **{x["c"]}**\n- 📄 [info/{sn}.md](info/{sn}.md)\n\n---\n\n')
+              Path(idxf).write_text(m)
+              print(f'📄 Index: {idxf}')
+              return idxf
+
+          # ========== MAIN LOGIC ==========
+          print(f'{"="*50}')
+          if is_youtube_url(U):
+              print(f'🎬 YouTube mode detected')
+              print(f'{"="*50}')
+
+              if M == 'search':
+                  v, _ = gvl(f'ytsearch{MX}:{U}', MX)
+                  if not v: print('❌ No results'); sys.exit(1)
+                  ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                  Path('./searches').mkdir(exist_ok=True)
+                  qs = safe_name(U, 30)
+                  f = f'searches/{qs}_{ts}.md'
+                  m = (f'# 🔍 Search: {U}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(v)} results**\n\n| # | Thumbnail | Title | Channel | Views | Duration |\n|---|-----------|-------|---------|-------|----------|\n')
+                  for i, x in enumerate(v, 1):
+                      m += f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) | [{x["t"]}]({x["u"]}) | {x["c"][:20]} | {x["v"]} | {x["dr"]//60}m |\n'
+                  m += '\n---\n\n'
+                  for i, x in enumerate(v, 1):
+                      m += (f'### {i}. {x["t"]}\n\n<img src="{x["th"]}" width="640">\n\n| Property | Value |\n|----------|-------|\n| Channel | {x["c"]} |\n| Duration | {x["dr"]//60}m |\n| Views | {x["v"]} |\n| ID | `{x["id"]}` |\n| URL | {x["u"]} |\n\n---\n\n')
+                  Path(f).write_text(m)
+                  print(f'✅ {f}')
+
+              elif M in ('playlist', 'channel'):
+                  v, cn = gvl(U, MX)
+                  if not v: print('❌ No videos found'); sys.exit(1)
+                  cd = Path(f'downloads/{cn}_videos')
+                  cd.mkdir(parents=True, exist_ok=True)
+                  mkidx(v, cn, cd)
+                  ok, fl = [], []
+                  for i, x in enumerate(v, 1):
+                      print(f'\n📥 [{i}/{len(v)}] {x["t"]}')
+                      result = dl_video(x['u'])
+                      if result:
+                          fp = cd / f'v{i:03d}_{x["id"]}.{result["e"]}'
+                          size = download_file(result['u'], fp)
+                          if size:
+                              print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
+                              split_file(fp, SP)
+                              ok.append(x['t'])
+                          else:
+                              fl.append(x['t'])
+                      else:
+                          fl.append(x['t'])
+                      if i < len(v): time.sleep(2)
+                  print(f'\n📊 {len(ok)}/{len(v)} downloaded')
+                  if fl: print(f'❌ Failed: {fl}')
+
+              else:  # single video
+                  vid_match = re.search(r'(?:v=|/)([\w-]{11})', U)
+                  vid = vid_match.group(1) if vid_match else 'x'
+                  ch, _, _, handle = gv(vid)
+                  cn = handle if handle else get_channel_from_url(U) or safe_name(ch, 30) or 'video'
+                  result = dl_video(U)
+                  if result:
+                      cd = Path(f'downloads/{cn}_videos')
+                      cd.mkdir(parents=True, exist_ok=True)
+                      fp = cd / f'v_{vid}.{result["e"]}'
+                      size = download_file(result['u'], fp)
+                      if size:
+                          print(f'✅ Saved to {cn}_videos/ ({size/1e6:.1f}MB)')
+                          split_file(fp, SP)
+                  else:
+                      print('❌ Failed'); sys.exit(1)
+
+          else:
+              print(f'🌐 Direct download mode (non-YouTube)')
+              print(f'{"="*50}')
+              # Generic direct download
+              out_dir = Path('downloads/direct_files')
+              out_dir.mkdir(parents=True, exist_ok=True)
+              
+              # Generate a safe filename from URL
+              parsed = urlparse(U)
+              base = os.path.basename(parsed.path)
+              if not base or '.' not in base:
+                  base = hashlib.md5(U.encode()).hexdigest()[:12] + '.bin'
+              else:
+                  base = safe_name(base, 50)
+              
+              out_path = out_dir / base
+              print(f'📁 Destination: {out_path}')
+              
+              success, size = download_direct_file(U, out_path)
+              if success and size > 0:
+                  print(f'✅ Saved to direct_files/ ({size/1e6:.1f}MB)')
+                  split_file(out_path, SP)
+              else:
+                  print('❌ Download failed')
+                  sys.exit(1)
+          PYEOF
+
+      - name: 📤 Push Files
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📤 PUSHING TO GITHUB"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "bot@github.com"
+          
+          BRANCH="downloaded-$(date +%Y%m%d-%H%M%S)"
+          echo "🔄 Creating branch: $BRANCH"
+          git checkout -b "$BRANCH"
+          
+          echo "📋 Adding all files..."
+          git add -A
+          
+          TOTAL=$(git diff --cached --name-only | wc -l)
+          echo "   Found $TOTAL files"
+          
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "⚠️ Nothing to push – no changes"
+            exit 0
+          fi
+          
+          git diff --cached --name-only | while read f; do
+            echo "   📎 $f"
+          done
+          
+          git commit -m "📦 Download $(date +%Y%m%d-%H%M%S) [skip ci]" --quiet
+          echo "📤 Pushing branch $BRANCH..."
+          if git push origin "$BRANCH"; then
+            echo "✅ Successfully pushed to branch: $BRANCH"
+          else
+            echo "❌ Git push failed"
+            exit 1
+          fi
