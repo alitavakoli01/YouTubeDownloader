@@ -90,7 +90,7 @@ jobs:
           SPLIT: ${{ github.event.inputs.split_threshold_mb }}
         run: |
           python3 << 'PYEOF'
-          import os, json, time, re, subprocess, sys, hashlib
+          import os, json, time, re, subprocess, sys, hashlib, shutil, glob
           import requests as rq
           from pathlib import Path
           from datetime import datetime
@@ -111,13 +111,16 @@ jobs:
               'Origin': 'https://media.ytmp3.gg'
           }
 
+          # ─── Helper: detect YouTube ───
+          def is_youtube(url):
+              return bool(re.search(r'(youtube\.com|youtu\.be)', url, re.I))
+
           def safe_name(text, maxlen=40):
               safe = re.sub(r'[^\w]', '_', text)[:maxlen]
               safe = re.sub(r'_+', '_', safe).strip('_')
               if not safe:
                   safe = hashlib.md5(text.encode()).hexdigest()[:8]
               return safe
-
           def fm(n):
               if not n: return 'N/A'
               try:
@@ -125,12 +128,12 @@ jobs:
                   return f'{n/1e6:.1f}M' if n >= 1e6 else f'{n/1e3:.1f}K' if n >= 1e3 else str(n)
               except: return str(n)
 
-          def gv(vid):
-              """Get video info AND channel name from actual video data"""
+          def gv(vid_or_url):
+              """Get video info. Accepts YouTube video ID OR full URL (any platform)."""
               try:
+                  url = vid_or_url if vid_or_url.startswith('http') else f'https://youtube.com/watch?v={vid_or_url}'
                   r = subprocess.run(
-                      ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate',
-                       f'https://youtube.com/watch?v={vid}'],
+                      ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate', url],
                       capture_output=True, text=True, timeout=15
                   )
                   if r.returncode == 0 and r.stdout.strip():
@@ -141,11 +144,9 @@ jobs:
                       duration = d.get('duration', 0)
                       channel_url = d.get('channel_url', '') or d.get('uploader_url', '')
                       handle = None
-                      # Try to get @handle from channel_url
                       if channel_url:
                           m = re.search(r'@([\w-]+)', channel_url)
                           if m: handle = m.group(1)
-                      # Fallback: use channel name as folder name
                       if not handle:
                           handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
                       return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
@@ -154,16 +155,12 @@ jobs:
 
           def get_channel_from_url(url):
               """Extract channel identifier from any YouTube URL"""
-              # Try @handle
               m = re.search(r'@([\w-]+)', url)
               if m: return m.group(1)
-              # Try channel/ID
               m = re.search(r'channel/([\w-]+)', url)
               if m: return m.group(1)
-              # Try c/name
               m = re.search(r'c/([\w-]+)', url)
               if m: return m.group(1)
-              # Try /user/name
               m = re.search(r'user/([\w-]+)', url)
               if m: return m.group(1)
               return None
@@ -171,7 +168,6 @@ jobs:
           def get_channel_from_playlist(playlist_url):
               """Get the actual channel name from a playlist by looking at its first video"""
               try:
-                  # Get first video from playlist
                   cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--playlist-end', '1',
                          '--no-warnings', '--no-check-certificate', playlist_url]
                   r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -181,7 +177,6 @@ jobs:
                       if vid:
                           _, _, _, handle = gv(vid)
                           if handle: return handle
-                      # Fallback to uploader/channel from flat data
                       ch = d.get('channel') or d.get('uploader') or d.get('uploader_id')
                       if ch: return safe_name(ch, 30)
               except: pass
@@ -189,15 +184,22 @@ jobs:
 
           def gvl(u, n):
               """Get video list - returns (videos, channel_folder_name)"""
-              # Step 1: Try to get channel from URL pattern
+              is_yt = is_youtube(u)
+
+              if not is_yt:
+                  print(f'   🌐 Non-YouTube platform detected')
+                  # For non-YouTube: use yt-dlp flat playlist / search
+                  if M == 'search':
+                      # ytsearch doesn't work for non-YouTube; use the URL directly as a search on the platform
+                      print(f'   ⚠️ Search mode only works for YouTube. Falling back to single URL mode.')
+                      return [], 'other'
+
               channel_folder = get_channel_from_url(u)
               
-              # Step 2: If playlist and no channel found, get from first video
               if not channel_folder and 'playlist' in u:
                   print(f'   🔍 Detecting channel from playlist...')
                   channel_folder = get_channel_from_playlist(u)
               
-              # Step 3: Last resort
               if not channel_folder:
                   channel_folder = 'playlist_videos'
               
@@ -218,7 +220,16 @@ jobs:
                           title = d.get('title', 'Untitled')[:60]
                           print(f'   📊 [{len(v)+1}/{n}] {title}...')
                           
-                          ch, vw, dr, _ = gv(vid)
+                          # Use webpage_url if available, otherwise construct
+                          vid_url = d.get('webpage_url') or d.get('url') or ''
+                          if not vid_url:
+                              vid_url = f'https://youtube.com/watch?v={vid}' if is_yt else d.get('url', '')
+                          
+                          if is_yt:
+                              ch, vw, dr, _ = gv(vid)
+                          else:
+                              # For non-YouTube, get info from the full URL
+                              ch, vw, dr, _ = gv(vid_url) if vid_url else ('Unknown', None, 0, None)
                           
                           if not ch or ch == 'Unknown':
                               ch = (d.get('channel') or d.get('uploader') or 
@@ -228,16 +239,15 @@ jobs:
                           
                           v.append({
                               'id': vid, 't': title,
-                              'u': f'https://youtube.com/watch?v={vid}',
+                              'u': vid_url,
                               'dr': int(dr) if dr else 0,
-                              'th': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg',
+                              'th': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg' if is_yt else '',
                               'c': str(ch).strip() if ch else 'Unknown',
                               'v': fm(vw)
                           })
                       except Exception as e:
                           print(f'      ⚠️ Skip: {str(e)[:40]}')
                           continue
-              
               return v, channel_folder
 
           def mkidx(v, cn, cd):
@@ -252,14 +262,16 @@ jobs:
                    f'|---|-----------|-------|----------|-------|\n')
               for i, x in enumerate(v, 1):
                   dur_str = f'{x["dr"]//60}:{x["dr"]%60:02d}' if x['dr'] else '?'
-                  m += f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) | [{x["t"]}]({x["u"]}) | {dur_str} | {x["v"]} |\n'
+                  thumb = f'[<img src="{x["th"]}" width="80">]({x["u"]})' if x['th'] else f'[🔗]({x["u"]})'
+                  m += f'| {i} | {thumb} | [{x["t"]}]({x["u"]}) | {dur_str} | {x["v"]} |\n'
               
               m += '\n---\n\n## 📝 Details\n\n'
               for i, x in enumerate(v, 1):
                   sn = f'v{i:03d}_{x["id"]}'
                   dur_str = f'{x["dr"]//60} minutes' if x['dr'] else 'Unknown'
+                  thumb_section = f'![Thumbnail]({x["th"]})\n\n' if x['th'] else ''
                   info_md = (f'# 🎬 {x["t"]}\n\n'
-                            f'![Thumbnail]({x["th"]})\n\n'
+                            f'{thumb_section}'
                             f'## Info\n\n'
                             f'| Property | Value |\n|----------|-------|\n'
                             f'| **Channel** | {x["c"]} |\n'
@@ -267,12 +279,11 @@ jobs:
                             f'| **Views** | {x["v"]} |\n'
                             f'| **Video ID** | `{x["id"]}` |\n'
                             f'| **URL** | {x["u"]} |\n\n'
-                            f'## Thumbnail\n\n'
-                            f'<img src="{x["th"]}" width="640">\n\n'
                             f'---\n*Downloaded: {datetime.now():%Y-%m-%d %H:%M}*')
                   (inf / f'{sn}.md').write_text(info_md)
+                  thumb_line = f'![Thumbnail]({x["th"]})\n\n' if x['th'] else ''
                   m += (f'### {i}. {x["t"]}\n\n'
-                       f'![Thumbnail]({x["th"]})\n\n'
+                       f'{thumb_line}'
                        f'- **{dur_str}** | **{x["v"]}** views | **{x["c"]}**\n'
                        f'- 📄 [info/{sn}.md](info/{sn}.md)\n\n---\n\n')
               
@@ -280,7 +291,56 @@ jobs:
               print(f'📄 Index: {idxf}')
               return idxf
 
+          # ─── Direct download via yt-dlp (for non-YouTube sites) ───
+          def dl_video_direct(u):
+              """Download video/audio from any site using yt-dlp directly"""
+              ext = 'mp3' if T == 'audio' else 'mp4'
+              outtmpl = '/tmp/ytdlp_%(id)s.%(ext)s'
+              
+              cmd = ['yt-dlp', '--no-warnings', '--no-check-certificate',
+                     '-o', outtmpl, '--print', 'after_move:filepath']
+              
+              if T == 'audio':
+                  q_val = Q if Q.isdigit() else '192'
+                  cmd.extend(['-x', '--audio-format', 'mp3', '--audio-quality', q_val])
+              else:
+                  cmd.extend(['-f', f'bestvideo[height<={Q}]+bestaudio/best[height<={Q}]',
+                              '--merge-output-format', 'mp4'])
+              
+              cmd.append(u)
+              
+              print(f'   🎯 Using yt-dlp direct download...')
+              try:
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  if r.returncode == 0 and r.stdout.strip():
+                      for line in r.stdout.strip().split('\n'):
+                          line = line.strip()
+                          if line and os.path.exists(line):
+                              print(f'   ✅ Downloaded to: {os.path.basename(line)}')
+                              return {'u': f'local://{line}', 'e': ext}
+                  
+                  # Fallback: search for downloaded files
+                  files = sorted(glob.glob('/tmp/ytdlp_*'), key=os.path.getmtime, reverse=True)
+                  if files:
+                      print(f'   ✅ Found: {os.path.basename(files[0])}')
+                      return {'u': f'local://{files[0]}', 'e': ext}
+                  
+                  # Print error output
+                  if r.stderr:
+                      print(f'   ⚠️ yt-dlp stderr: {r.stderr[:200]}')
+              except subprocess.TimeoutExpired:
+                  print(f'   ❌ Timeout (600s)')
+              except Exception as e:
+                  print(f'   ❌ Direct download error: {e}')
+              
+              return None
+
+          # ─── YouTube API download (unchanged) ───
           def dl_video(u):
+              """Download from YouTube via external API, or use yt-dlp for other sites."""
+              if not is_youtube(u):
+                  return dl_video_direct(u)
+              
               e = 'mp3' if T == 'audio' else 'mp4'
               p = {'url': u, 'os': 'linux', 'output': {'type': 'audio' if T == 'audio' else 'video', 'format': e}}
               if T == 'audio': p['audio'] = {'bitrate': f'{Q}k'}
@@ -313,6 +373,20 @@ jobs:
               return None
 
           def download_file(url, filepath):
+              """Download from URL or copy from local path."""
+              # Handle local files from yt-dlp direct download
+              if url.startswith('local://'):
+                  local_path = url[8:]
+                  try:
+                      shutil.move(local_path, filepath)
+                      size = filepath.stat().st_size
+                      print(f'   ✅ Moved ({size/1e6:.1f}MB)')
+                      return size
+                  except Exception as e:
+                      print(f'   ❌ Move error: {e}')
+                      return 0
+              
+              # Original: download from remote URL
               try:
                   dr = rq.get(url, headers=H, stream=True, timeout=600)
                   if dr.status_code == 200:
@@ -415,13 +489,20 @@ jobs:
               print(f'{"="*50}')
 
           else:
-              # Single video mode
-              vid_match = re.search(r'(?:v=|/)([\w-]{11})', U)
-              vid = vid_match.group(1) if vid_match else 'x'
+              # Single video mode — handles YouTube AND other platforms
+              print(f'\n🎬 Processing: {U}')
               
-              # Get channel from the video itself
-              ch, _, _, handle = gv(vid)
-              cn = handle if handle else get_channel_from_url(U) or safe_name(ch, 30) or 'video'
+              if is_youtube(U):
+                  # YouTube single: extract video ID
+                  vid_match = re.search(r'(?:v=|/)([\w-]{11})', U)
+                  vid = vid_match.group(1) if vid_match else 'x'
+                  ch, _, _, handle = gv(vid)
+                  cn = handle if handle else get_channel_from_url(U) or safe_name(ch, 30) or 'video'
+              else:
+                  # Non-YouTube single: get info from the URL directly
+                  ch, _, _, handle = gv(U)  # gv now accepts full URLs
+                  vid = safe_name(U, 20)  # Use URL hash as ID
+                  cn = handle if handle else safe_name(ch, 30) or 'other_video'
               
               result = dl_video(U)
               if result:
@@ -477,6 +558,5 @@ jobs:
             git rebase --abort 2>/dev/null
             [ $i -lt 5 ] && sleep $((i*5))
           done
-          
           echo "   ❌ Push failed"
           exit 1
